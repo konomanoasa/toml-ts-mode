@@ -54,18 +54,18 @@
   (get-text-property (+ (toml-ts-mode-test--position fragment line)
                         (or offset 0)) 'face))
 
-(defun toml-ts-mode-test--indent (source offset)
+(defun toml-ts-mode-test--indent (source &optional offset)
   (with-temp-buffer
     (insert source)
     (toml-ts-mode)
-    (setq-local toml-ts-mode-indent-offset offset)
     (setq-local indent-tabs-mode nil)
+    (when offset
+      (setq-local toml-ts-mode-indent-offset offset))
     (indent-region (point-min) (point-max))
-    (let ((result (buffer-substring-no-properties (point-min) (point-max))))
+    (let ((indented (buffer-string)))
       (indent-region (point-min) (point-max))
-      (should (equal result (buffer-substring-no-properties
-                             (point-min) (point-max))))
-      result)))
+      (should (equal (buffer-string) indented))
+      indented)))
 
 (defun toml-ts-mode-test--buffer-state ()
   (font-lock-ensure)
@@ -131,7 +131,7 @@
 ;;;; Mode Selection
 
 (ert-deftest toml-ts-mode-selects-files ()
-  (dolist (filename '("/tmp/config.toml" "/tmp/Cargo.lock"))
+  (dolist (filename '("/tmp/config.toml" "Cargo.lock" "/tmp/Cargo.lock"))
     (with-temp-buffer
       (setq buffer-file-name filename)
       (set-auto-mode)
@@ -193,6 +193,88 @@
     (uncomment-region (point-min) (point-max))
     (should (equal (buffer-substring-no-properties (point-min) (point-max))
                    "s = \"# string\" # comment\n"))))
+
+(ert-deftest toml-ts-mode-classifies-only-owned-delimiters ()
+  (with-temp-buffer
+    (insert "s = \"\"\"[\\\"'`()]\n# text\n\"\"\"\na = [1]\n")
+    (toml-ts-mode)
+    (syntax-propertize (point-max))
+    (dolist (text '("[\\" "\\\"" "'" "`" "(" ")" "# text"))
+      (should (= (syntax-class (syntax-after (toml-ts-mode-test--position text))) 1)))
+    (goto-char (toml-ts-mode-test--position "[1]"))
+    (let ((start (point)))
+      (should (equal (funcall show-paren-data-function)
+                     (list start (1+ start) (+ start 2) (+ start 3)))))
+    (goto-char (toml-ts-mode-test--position "[\\"))
+    (should-not (funcall show-paren-data-function))))
+
+;;;; Electric Pair
+
+(ert-deftest toml-ts-mode-pairs-delimiters-and-indents-on-return ()
+  (dolist (case '(("a = " ?\[ "a = [\n  \n]" 2) ("a = " ?{ "a = {\n  \n}" 2) ("" ?\[ "[\n]" 0)))
+    (let ((electric-pair-pairs nil)
+          (electric-pair-open-newline-between-pairs t))
+      (with-temp-buffer
+        (toml-ts-mode)
+        (setq-local indent-tabs-mode nil)
+        (electric-indent-local-mode 1)
+        (electric-pair-local-mode 1)
+        (insert (nth 0 case))
+        (let ((last-command-event (nth 1 case)))
+          (self-insert-command 1))
+        (should (= (char-after) (cdr (assq (nth 1 case) electric-pair-pairs))))
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal (buffer-string) (nth 2 case)))
+        (should (= (current-column) (nth 3 case)))))))
+
+(ert-deftest toml-ts-mode-keeps-pair-preferences-local ()
+  (let ((electric-pair-pairs '((?% . ?%)))
+        (electric-pair-mode nil)
+        (electric-pair-open-newline-between-pairs nil))
+    (with-temp-buffer
+      (toml-ts-mode)
+      (should-not electric-pair-mode)
+      (should (equal (car electric-pair-pairs) '(?% . ?%)))
+      (electric-indent-local-mode 1)
+      (electric-pair-local-mode 1)
+      (insert "a = ")
+      (let ((last-command-event ?\[))
+        (self-insert-command 1))
+      (call-interactively (key-binding (kbd "RET")))
+      (should (= (count-lines (point-min) (point-max)) 2)))
+    (should (equal electric-pair-pairs '((?% . ?%))))
+    (should-not electric-pair-open-newline-between-pairs)))
+
+(ert-deftest toml-ts-mode-respects-custom-pairs-and-newline-function ()
+  (let ((electric-pair-pairs '((?\[ . ?!)))
+        (electric-pair-open-newline-between-pairs (lambda () nil)))
+    (with-temp-buffer
+      (toml-ts-mode)
+      (electric-pair-local-mode 1)
+      (insert "a = ")
+      (let ((last-command-event ?\[)) (self-insert-command 1))
+      (should (equal (buffer-string) "a = [!")))
+    (with-temp-buffer
+      (toml-ts-mode)
+      (electric-pair-local-mode 1)
+      (insert "a = ")
+      (let ((last-command-event ?{)) (self-insert-command 1))
+      (call-interactively (key-binding (kbd "RET")))
+      (should (= (count-lines (point-min) (point-max)) 2)))))
+
+(ert-deftest toml-ts-mode-adds-newline-only-between-container-delimiters ()
+  (dolist (source '("[|]" "[[|]]" "s = \"[|]\"" "s = '''{|}'''" "# [|]"))
+    (let ((electric-pair-open-newline-between-pairs t))
+      (with-temp-buffer
+        (insert source)
+        (toml-ts-mode)
+        (electric-pair-local-mode 1)
+        (goto-char (point-min))
+        (search-forward "|")
+        (delete-char -1)
+        (call-interactively (key-binding (kbd "RET")))
+        (should (= (count-lines (point-min) (point-max)) 2))))))
+
 
 ;;;; Font Lock
 
@@ -274,18 +356,67 @@
       (dotimes (offset (length (car case)))
         (should (eq (toml-ts-mode-test--face (car case) offset) (cadr case)))))))
 
+(ert-deftest toml-ts-mode-fontifies-line-continuation-at-level-four ()
+  (dolist (level '(1 2 3 4))
+    (with-temp-buffer
+      (insert "s = \"\"\"text\\\n  \n  next\"\"\"\n")
+      (let ((treesit-font-lock-level level)) (toml-ts-mode))
+      (font-lock-ensure)
+      (should (eq (toml-ts-mode-test--face "\\")
+                  (and (= level 4) 'font-lock-punctuation-face)))
+      (dotimes (offset 6)
+        (should-not (toml-ts-mode-test--face "\\" (1+ offset)))))))
+
 ;;;; Navigation
 
 (ert-deftest toml-ts-mode-navigates-structures ()
   (with-temp-buffer
     (insert "a = [1, 2]\nb = \"text\"\n")
     (toml-ts-mode)
-    (goto-char 5)
-    (forward-sexp)
-    (should (= 11 (point)))
-    (backward-sexp)
-    (should (= 5 (point)))
-    (should-not (assoc 'defun (cdr (assq 'toml treesit-thing-settings))))))
+    (should (equal (mapcar #'car (cdr (assq 'toml treesit-thing-settings)))
+                   '(sexp defun)))
+    (dolist (case '((1 1 11) (5 1 11) (6 1 7) (9 1 10)
+                    (11 -1 1) (7 -1 6) (10 -1 9) (2 -1 1)
+                    (1 2 22) (22 -2 1)))
+      (goto-char (nth 0 case))
+      (forward-sexp (nth 1 case))
+      (should (= (point) (nth 2 case))))))
+
+(ert-deftest toml-ts-mode-navigates-inline-entries-and-dotted-keys ()
+  (with-temp-buffer
+    (insert "a = { nested.key = [12, 34], other = true }\n")
+    (toml-ts-mode)
+    (dolist (case '(("nested.key" 0 1 "[12, 34]" 8)
+                    ("nested.key" 1 1 "nested.key" 10)
+                    ("nested.key" 10 -1 "nested.key" 0)
+                    ("[12, 34]" 8 -1 "nested.key" 0)
+                    ("12" 0 1 "12" 2)))
+      (goto-char (+ (toml-ts-mode-test--position (nth 0 case)) (nth 1 case)))
+      (forward-sexp (nth 2 case))
+      (should (= (point) (+ (toml-ts-mode-test--position (nth 3 case))
+                            (nth 4 case)))))
+    (goto-char (toml-ts-mode-test--position "nested.key"))
+    (should-error (backward-sexp) :type 'scan-error)))
+
+(ert-deftest toml-ts-mode-navigates-header-defuns ()
+  (with-temp-buffer
+    (insert "[server]\na = 1\n[[items]]\nx = 1\n")
+    (toml-ts-mode)
+    (goto-char (point-min))
+    (end-of-defun)
+    (should (= (point) 10))
+    (beginning-of-defun)
+    (should (= (point) 1))
+    (goto-char (point-max))
+    (beginning-of-defun)
+    (should (= (point) 16))
+    (end-of-defun)
+    (should (= (point) 26))
+    (goto-char 16)
+    (insert "# ")
+    (goto-char (point-max))
+    (beginning-of-defun)
+    (should (= (point) 1))))
 
 ;;;; Imenu
 
@@ -326,16 +457,47 @@
     (indent-according-to-mode)
     (should (= (current-column) toml-ts-mode-indent-offset))))
 
+(ert-deftest toml-ts-mode-indents-after-nested-closings ()
+  (dolist (case '(("a = [\n  [\n    1,\n  ],|\n]\n" 2)
+                  ("a = {\n  b = {\n    c = 1,\n  },|\n}\n" 2)
+                  ("a = [\n  [\n    [1],|\n  ],\n]\n" 4)))
+    (with-temp-buffer
+      (insert (car case))
+      (toml-ts-mode)
+      (setq-local indent-tabs-mode nil)
+      (electric-indent-local-mode 1)
+      (goto-char (point-min))
+      (search-forward "|")
+      (delete-char -1)
+      (call-interactively (key-binding (kbd "RET")))
+      (should (= (current-column) (cadr case))))))
+
+(ert-deftest toml-ts-mode-preserves-blank-string-content-on-indent ()
+  (dolist (source '("a = \"\"\"\n   |\ntext\n\"\"\"\n"
+                    "a = '''\n   |\ntext\n'''\n"
+                    "a = \"\"\"text\\\n   |\ntext\n\"\"\"\n"))
+    (with-temp-buffer
+      (insert source)
+      (toml-ts-mode)
+      (goto-char (point-min))
+      (search-forward "|")
+      (delete-char -1)
+      (indent-according-to-mode)
+      (should (= (current-column) 3)))))
+
 ;;;; Updates
 
 (ert-deftest toml-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
-                 '(("a = [1, 2]\n" "[1, 2]" "\"[1, 2]\"" "1" font-lock-string-face)
+                 '(("a = [1, 2] # text\n" "[1, 2]" "\"[1, 2]\"" "1" font-lock-string-face)
                    ("[[items]]\n" "[[items]]" "[items]" "[" font-lock-bracket-face)
-                   ("a = \"unfinished\n" "unfinished" "finished\"" "finished" font-lock-string-face)))
+                   ("a = \"unfinished\n" "unfinished" "finished\"" "finished" font-lock-string-face)
+                   ("a = \"x\"\n" "\"x\"" "\"\"\"x\n# text\n\"\"\"" "text" font-lock-string-face)
+                   ("a = \"\"\"x\n# text\n\"\"\"\n" "\"\"\"x\n# text\n\"\"\"" "\"x\"" "x" font-lock-string-face)
+                   ("a = \"\"\"x\ntext\n\"\"\"\n" "text" "\\q" "a" font-lock-property-name-face)
+                   ("a = \"\"\"x\ntext\n\"\"\"\n" "text\n\"\"\"" "text" "a" font-lock-property-name-face)))
     (ert-info ((format "%S: %S -> %S" source old new))
       (with-temp-buffer
-
         (insert source)
         (let ((treesit-font-lock-level 4)) (toml-ts-mode))
         (toml-ts-mode-test--buffer-state)
@@ -345,26 +507,6 @@
         (font-lock-ensure)
         (should (eq (toml-ts-mode-test--face fragment) face))
         (toml-ts-mode-test--should-match-fresh-buffer 4)))))
-
-(ert-deftest toml-ts-mode-edits-match-fresh-font-lock-and-syntax ()
-  (dolist (case '(("a = [1, 2] # text\n" "[1, 2]" "\"[1, 2]\"")
-                  ("[[items]]\n" "[[items]]" "[items]")
-                  ("a = \"x\"\n" "\"x\"" "\"\"\"x\n# text\n\"\"\"")
-                  ("a = \"\"\"x\n# text\n\"\"\"\n" "\"\"\"x\n# text\n\"\"\"" "\"x\"")
-                  ("a = \"unfinished\n" "unfinished" "finished\"")))
-    (with-temp-buffer
-      (insert (car case))
-      (let ((treesit-font-lock-level 4)) (toml-ts-mode))
-      (toml-ts-mode-test--buffer-state)
-      (goto-char (point-min))
-      (search-forward (cadr case))
-      (replace-match (nth 2 case) t t)
-      (let ((state (toml-ts-mode-test--buffer-state))
-            (source (buffer-substring-no-properties (point-min) (point-max))))
-        (with-temp-buffer
-          (insert source)
-          (let ((treesit-font-lock-level 4)) (toml-ts-mode))
-          (should (equal state (toml-ts-mode-test--buffer-state))))))))
 
 (ert-deftest toml-ts-mode-preserves-syntax-when-narrowed ()
   (with-temp-buffer

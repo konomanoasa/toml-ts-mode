@@ -35,24 +35,44 @@
 ;;; Code:
 
 (require 'paren)
+(require 'elec-pair)
 (require 'treesit)
 
 (defgroup toml-ts nil
   "Tree-sitter mode for TOML 1.1.0."
   :group 'languages)
 
+;;;; Grammar
+
 (defconst toml-ts-mode--grammar-sources
   '((toml "https://github.com/konomanoasa/tree-sitter-toml"
-          :revision "v0.3.0"))
+          :revision "v0.5.0"))
   "Tree-sitter grammar sources for TOML 1.1.0.")
+
+(defun toml-ts-mode--ensure-grammar (language)
+  "Ensure that the grammar for LANGUAGE is installed."
+  (let ((treesit-language-source-alist
+         (if (assq language treesit-language-source-alist)
+             treesit-language-source-alist
+           (cons (assq language toml-ts-mode--grammar-sources)
+                 treesit-language-source-alist))))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 ;;;; Syntax
 
-(defvar toml-ts-mode-syntax-table
+(defvar toml-ts-mode-syntax--text-table
   (let ((table (make-syntax-table prog-mode-syntax-table)))
-    (dolist (character '(?# ?\" ?\' ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
+    (dolist (character '(?# ?\" ?\' ?` ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
       (modify-syntax-entry character "." table))
     (modify-syntax-entry ?\n ">" table)
+    table)
+  "Syntax table for text without a CST syntax classification.")
+
+(defvar toml-ts-mode-syntax-table
+  (let ((table (copy-syntax-table toml-ts-mode-syntax--text-table)))
+    (dolist (entry '((?\[ . "(]") (?\] . ")[") (?{ . "(}") (?} . "){")))
+      (modify-syntax-entry (car entry) (cdr entry) table))
     table)
   "Syntax table for `toml-ts-mode'.")
 
@@ -66,10 +86,10 @@
      (literal_string) @string
      (ml_basic_string) @string
      (ml_literal_string) @string
-     (array "[" @open "]" @close)
-     (inline_table "{" @open "}" @close)
-     (std_table "[" @open "]" @close)
-     (array_table "[[" @open "]]" @close)))
+     (array "[" @open) (array "]" @close)
+     (inline_table "{" @open) (inline_table "}" @close)
+     (std_table "[" @open) (std_table "]" @close)
+     (array_table "[[" @open) (array_table "]]" @close)))
   "Compiled syntax query for TOML 1.1.0.")
 
 ;;;;; Propertization
@@ -81,9 +101,9 @@
       (widen)
       (when (and (= start accessible-start)
                  (> accessible-start (point-min)))
-        (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
+      (put-text-property start end 'syntax-table toml-ts-mode-syntax--text-table)
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
                         toml-ts-mode-syntax--query start end))
@@ -97,11 +117,23 @@
                (put-text-property begin (1+ begin) 'syntax-table
                                   (string-to-syntax "<")))
               ('string
-               (unless (treesit-node-check node 'has-error)
-                 (put-text-property begin (1+ begin) 'syntax-table
-                                    (string-to-syntax "|"))
-                 (put-text-property (1- finish) finish 'syntax-table
-                                    (string-to-syntax "|"))))
+               (put-text-property begin finish 'syntax-table
+                                  toml-ts-mode-syntax--text-table)
+               (let ((opening (treesit-node-child node 0))
+                     (closing (treesit-node-child node -1)))
+                 (when (and (not (treesit-node-check node 'has-error))
+                            (member (treesit-node-type opening)
+                                    '("\"" "'" "\"\"\"" "'''"))
+                            (equal (treesit-node-type opening)
+                                   (treesit-node-type closing))
+                            (< (treesit-node-start opening)
+                               (treesit-node-start closing)))
+                   (put-text-property (treesit-node-start opening)
+                                      (1+ (treesit-node-start opening))
+                                      'syntax-table (string-to-syntax "|"))
+                   (put-text-property (1- (treesit-node-end closing))
+                                      (treesit-node-end closing)
+                                      'syntax-table (string-to-syntax "|")))))
               ((or 'open 'close)
                (let ((syntax (if (eq name 'open)
                                  (if (equal (treesit-node-type node) "{")
@@ -115,9 +147,40 @@
                                       (string-to-syntax
                                        (concat syntax "p")))))))))))))
 
+;;;;; Matching Delimiters
+
+(defun toml-ts-mode-syntax--show-paren-data ()
+  "Return matching delimiter ranges from their CST owner."
+  (let ((position (point)))
+    (catch 'match
+      (dolist (capture (treesit-query-capture
+                        (treesit-parser-root-node treesit-primary-parser)
+                        toml-ts-mode-syntax--query
+                        (max (point-min) (1- position))
+                        (min (point-max) (1+ position))))
+        (let* ((name (car capture))
+               (node (cdr capture))
+               (owner (treesit-node-parent node))
+               (opening (treesit-node-child owner 0))
+               (closing (treesit-node-child owner -1)))
+          (when (and (or (and (eq name 'open)
+                              (= position (treesit-node-start node)))
+                         (and (eq name 'close)
+                              (= position (treesit-node-end node))))
+                     (not (treesit-node-check opening 'missing))
+                     (not (treesit-node-check closing 'missing))
+                     (member (list (treesit-node-type opening)
+                                   (treesit-node-type closing))
+                             '(("[" "]") ("[[" "]]") ("{" "}"))))
+            (let ((other (if (eq name 'open) closing opening)))
+              (throw 'match (list (treesit-node-start node)
+                                  (treesit-node-end node)
+                                  (treesit-node-start other)
+                                  (treesit-node-end other))))))))))
+
 ;;;;; Setup
 
-(defun toml-ts-mode-syntax-setup ()
+(defun toml-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
   (setq-local syntax-propertize-function
               #'toml-ts-mode-syntax--propertize)
@@ -126,7 +189,43 @@
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
-  (setq-local comment-use-syntax t))
+  (setq-local comment-use-syntax t)
+  (setq-local show-paren-data-function #'toml-ts-mode-syntax--show-paren-data))
+
+;;;; Electric Pair
+
+(defun toml-ts-mode-electric-pair--newline-context-p ()
+  "Return non-nil between adjacent delimiters of an array or inline table."
+  (when (and (eq (char-before) ?\n)
+             (>= (- (point) 2) (point-min))
+             (< (point) (point-max)))
+    (let* ((opening (treesit-node-at (- (point) 2) treesit-primary-parser))
+           (closing (treesit-node-at (point) treesit-primary-parser))
+           (owner (treesit-node-parent opening)))
+      (and (= (treesit-node-start opening) (- (point) 2))
+           (= (treesit-node-end opening) (1- (point)))
+           (= (treesit-node-start closing) (point))
+           (= (treesit-node-end closing) (1+ (point)))
+           (treesit-node-eq owner (treesit-node-parent closing))
+           (member (list (treesit-node-type owner)
+                         (treesit-node-type opening)
+                         (treesit-node-type closing))
+                   '(("array" "[" "]") ("inline_table" "{" "}")))))))
+
+(defun toml-ts-mode-electric-pair--setup ()
+  "Configure electric pairing for the current buffer."
+  (let ((pairs '((?\[ . ?\]) (?{ . ?})))
+        (table (copy-syntax-table (syntax-table))))
+    (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
+    (dolist (pair pairs)
+      (unless (eq (cdr (assq (car pair) electric-pair-pairs)) (cdr pair))
+        (modify-syntax-entry (car pair) "." table)))
+    (set-syntax-table table))
+  (let ((setting electric-pair-open-newline-between-pairs))
+    (setq-local electric-pair-open-newline-between-pairs
+                (lambda ()
+                  (and (if (functionp setting) (funcall setting) setting)
+                       (toml-ts-mode-electric-pair--newline-context-p))))))
 
 ;;;; Font Lock
 
@@ -136,7 +235,7 @@
   '((comment)
     (key string)
     (number boolean date-time escape)
-    (operator delimiter bracket))
+    (operator delimiter punctuation bracket))
   "Font-lock features by decoration level.")
 
 ;;;;; Settings
@@ -202,8 +301,10 @@
    '((escaped "\\" @font-lock-escape-face)
      (escape_seq_char
       ["\"" "\\" "b" "e" "f" "n" "r" "t" "x" "u" "U" (hexdig)]
-      @font-lock-escape-face)
-     (mlb_escaped_nl "\\" @font-lock-escape-face))
+      @font-lock-escape-face))
+
+   :feature 'punctuation
+   '((mlb_escaped_nl "\\" @font-lock-punctuation-face))
 
    :feature 'operator
    '((keyval "=" @font-lock-operator-face))
@@ -221,7 +322,7 @@
 
 ;;;;; Setup
 
-(defun toml-ts-mode-font-lock-setup ()
+(defun toml-ts-mode-font-lock--setup ()
   "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               toml-ts-mode-font-lock--feature-list)
@@ -230,36 +331,49 @@
 
 ;;;; Navigation
 
-(defconst toml-ts-mode-thing-settings
-  `((toml (sexp "^val$")
-          (list ,(rx string-start
-                     (or "array" "inline_table" "std_table" "array_table")
-                     string-end))))
+(defun toml-ts-mode-navigation--sexp-p (node)
+  "Return non-nil if NODE is a representative editing unit."
+  (let ((type (treesit-node-type node))
+        (parent (treesit-node-parent node)))
+    (and (< (treesit-node-start node) (treesit-node-end node))
+         (or (member type '("keyval" "key" "val"))
+             (and (member type '("array" "inline_table"))
+                  (not (and (equal (treesit-node-type parent) "val")
+                            (= (treesit-node-start parent) (treesit-node-start node))
+                            (= (treesit-node-end parent) (treesit-node-end node)))))))))
+
+(defconst toml-ts-mode-navigation--settings
+  `((toml (sexp toml-ts-mode-navigation--sexp-p)
+          (defun ,(rx string-start (or "std_table" "array_table") string-end))))
   "Tree-sitter thing definitions for TOML 1.1.0.")
 
-(defun toml-ts-mode-navigation-setup ()
+(defun toml-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
   (setq-local treesit-thing-settings
-              toml-ts-mode-thing-settings))
+              toml-ts-mode-navigation--settings))
 
 ;;;; Imenu
 
-(defconst toml-ts-mode-imenu-settings
-  `(("Table" ,(rx string-start (or "std_table" "array_table") string-end)
-     nil nil))
-  "Tree-sitter Imenu settings for TOML 1.1.0.")
-
-(defun toml-ts-mode--defun-name (node)
+(defun toml-ts-mode-imenu--name (node)
   "Return the source name of NODE, or nil if it has no name."
   (when (member (treesit-node-type node) '("std_table" "array_table"))
-    (treesit-node-text node t)))
+    (let ((key (treesit-node-child-by-field-name node "key")))
+      (when (and key
+                 (< (treesit-node-start key) (treesit-node-end key))
+                 (not (treesit-node-check key 'missing)))
+        (treesit-node-text node t)))))
 
-(defun toml-ts-mode-imenu-setup ()
+(defconst toml-ts-mode-imenu--settings
+  `(("Table" ,(rx string-start (or "std_table" "array_table") string-end)
+     toml-ts-mode-imenu--name nil))
+  "Tree-sitter Imenu settings for TOML 1.1.0.")
+
+(defun toml-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
   (setq-local treesit-defun-name-function
-              #'toml-ts-mode--defun-name)
+              #'toml-ts-mode-imenu--name)
   (setq-local treesit-simple-imenu-settings
-              toml-ts-mode-imenu-settings))
+              toml-ts-mode-imenu--settings))
 
 ;;;; Indentation
 
@@ -268,7 +382,7 @@
   :type 'natnum
   :group 'toml-ts)
 
-(defconst toml-ts-mode-indent-rules
+(defconst toml-ts-mode-indent--rules
   '((toml
      ((parent-is "^ml_basic_string$") no-indent 0)
      ((parent-is "^ml_literal_string$") no-indent 0)
@@ -287,34 +401,24 @@
      ((parent-is "^expression$") column-0 0)))
   "Tree-sitter indentation rules for TOML 1.1.0.")
 
-(defun toml-ts-mode-indent-setup ()
+(defun toml-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
   (setq-local treesit-simple-indent-rules
-              toml-ts-mode-indent-rules))
+              toml-ts-mode-indent--rules))
 
 ;;;; Mode
-
-(defun toml-ts-mode--ensure-grammar (language)
-  "Ensure that the grammar for LANGUAGE is installed."
-  (let ((treesit-language-source-alist
-         (if (assq language treesit-language-source-alist)
-             treesit-language-source-alist
-           (cons (assq language toml-ts-mode--grammar-sources)
-                 treesit-language-source-alist))))
-    (or (treesit-ensure-installed language)
-        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun toml-ts-mode--setup ()
   "Configure `toml-ts-mode' in the current buffer."
   (toml-ts-mode--ensure-grammar 'toml)
   (setq-local treesit-primary-parser (treesit-parser-create 'toml))
-  (toml-ts-mode-syntax-setup)
-  (toml-ts-mode-font-lock-setup)
-  (toml-ts-mode-navigation-setup)
-  (toml-ts-mode-imenu-setup)
-  (toml-ts-mode-indent-setup)
-  (treesit-major-mode-setup)
-  (setq-local show-paren-data-function #'treesit-show-paren-data))
+  (toml-ts-mode-syntax--setup)
+  (toml-ts-mode-electric-pair--setup)
+  (toml-ts-mode-font-lock--setup)
+  (toml-ts-mode-navigation--setup)
+  (toml-ts-mode-imenu--setup)
+  (toml-ts-mode-indent--setup)
+  (treesit-major-mode-setup))
 
 ;;;###autoload
 (define-derived-mode toml-ts-mode prog-mode "TOML-TS"
@@ -327,7 +431,7 @@
 (add-to-list 'auto-mode-alist '("\\.toml\\'" . toml-ts-mode))
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("/Cargo\\.lock\\'" . toml-ts-mode))
+(add-to-list 'auto-mode-alist '("\\(?:\\`\\|/\\)Cargo\\.lock\\'" . toml-ts-mode))
 
 (provide 'toml-ts-mode)
 
