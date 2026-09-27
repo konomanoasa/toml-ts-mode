@@ -34,8 +34,9 @@
 
 ;;; Code:
 
-(require 'paren)
 (require 'elec-pair)
+(require 'newcomment)
+(require 'paren)
 (require 'treesit)
 
 (defgroup toml-ts nil
@@ -186,11 +187,26 @@
               #'toml-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
             #'syntax-propertize-wholelines nil t)
+  (setq-local show-paren-data-function #'toml-ts-mode-syntax--show-paren-data))
+
+;;;; Comment Commands
+
+(defun toml-ts-mode-comment--uncomment-region (beg end &optional arg)
+  "Uncomment BEG through END using syntax classified before editing.
+Pass ARG to `uncomment-region-default'."
+  (syntax-propertize end)
+  (unwind-protect
+      (let ((syntax-propertize-function nil))
+        (uncomment-region-default beg end arg))
+    (syntax-ppss-flush-cache beg)))
+
+(defun toml-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
   (setq-local comment-use-syntax t)
-  (setq-local show-paren-data-function #'toml-ts-mode-syntax--show-paren-data))
+  (setq-local uncomment-region-function #'toml-ts-mode-comment--uncomment-region))
 
 ;;;; Electric Pair
 
@@ -214,7 +230,8 @@
 
 (defun toml-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
-  (let ((pairs '((?\[ . ?\]) (?{ . ?})))
+  (let ((pairs '((?\[ . ?\]) (?{ . ?})
+                 (?\" . ?\") (?\' . ?\')))
         (table (copy-syntax-table (syntax-table))))
     (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
     (dolist (pair pairs)
@@ -413,6 +430,7 @@
   (toml-ts-mode--ensure-grammar 'toml)
   (setq-local treesit-primary-parser (treesit-parser-create 'toml))
   (toml-ts-mode-syntax--setup)
+  (toml-ts-mode-comment--setup)
   (toml-ts-mode-electric-pair--setup)
   (toml-ts-mode-font-lock--setup)
   (toml-ts-mode-navigation--setup)
