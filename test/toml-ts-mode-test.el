@@ -36,6 +36,7 @@
 ;;;; Helpers
 
 (defun toml-ts-mode-test--position (fragment &optional line)
+  "Return FRAGMENT's start in LINE, or anywhere when LINE is nil."
   (save-excursion
     (goto-char (point-min))
     (when line
@@ -51,10 +52,12 @@
     (- (point) (length fragment))))
 
 (defun toml-ts-mode-test--face (fragment &optional offset line)
+  "Return the face at OFFSET into FRAGMENT on LINE."
   (get-text-property (+ (toml-ts-mode-test--position fragment line)
                         (or offset 0)) 'face))
 
 (defun toml-ts-mode-test--indent (source &optional offset)
+  "Indent SOURCE twice using OFFSET and assert stable whitespace."
   (with-temp-buffer
     (insert source)
     (toml-ts-mode)
@@ -68,6 +71,7 @@
       indented)))
 
 (defun toml-ts-mode-test--buffer-state ()
+  "Return current face and syntax properties after refreshing the buffer."
   (font-lock-ensure)
   (syntax-propertize (point-max))
   (let (state)
@@ -77,6 +81,7 @@
     (nreverse state)))
 
 (defun toml-ts-mode-test--should-match-fresh-buffer (level)
+  "Check the current buffer against fresh fontification at LEVEL."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (toml-ts-mode-test--buffer-state))
         (file buffer-file-name))
@@ -397,6 +402,53 @@
                      ("false" 0 font-lock-constant-face)))
       (should (eq (toml-ts-mode-test--face fragment offset) face)))))
 
+(ert-deftest toml-ts-mode-fontifies-normal-leaves-around-issues ()
+  (with-temp-buffer
+    (insert "[a b]\nx = [01, 2026-13-01, +in]\ns = \"x\\qy\"\n"
+            "# x\0y\nu = \"open")
+    (let ((treesit-font-lock-level 4)) (toml-ts-mode))
+    (font-lock-ensure)
+    (pcase-dolist (`(,fragment ,offset ,face)
+                   '(("[a b]" 0 font-lock-bracket-face)
+                     ("[a b]" 3 font-lock-property-name-face)
+                     ("01," 0 font-lock-number-face)
+                     ("01," 1 font-lock-number-face)
+                     ("13-01" 0 font-lock-constant-face)
+                     ("13-01" 1 font-lock-constant-face)
+                     ("+in" 0 font-lock-number-face)
+                     ("+in" 1 nil)
+                     ("x\\qy" 0 font-lock-string-face)
+                     ("x\\qy" 1 nil)
+                     ("x\\qy" 3 font-lock-string-face)
+                     ("# x\0y" 2 font-lock-comment-face)
+                     ("# x\0y" 3 nil)
+                     ("# x\0y" 4 font-lock-comment-face)
+                     ("open" 0 font-lock-string-face)))
+      (should (eq (toml-ts-mode-test--face fragment offset) face)))
+    (syntax-propertize (point-max))
+    (should-not (nth 3 (syntax-ppss (toml-ts-mode-test--position "\\q"))))
+    (should (nth 4 (syntax-ppss (+ 4 (toml-ts-mode-test--position "# x\0y")))))
+    (should-not (nth 3 (syntax-ppss (point-max))))
+    (should (equal (mapcar #'car (cdar (funcall imenu-create-index-function)))
+                   '("[a b]")))))
+
+(ert-deftest toml-ts-mode-missing-closings-do-not-create-matching-delimiters ()
+  (dolist (source '("a=[1" "a={b=1" "[[a]"))
+    (with-temp-buffer
+      (insert source)
+      (toml-ts-mode)
+      (syntax-propertize (point-max))
+      (goto-char (point-min))
+      (search-forward (if (equal source "a={b=1") "{" "["))
+      (backward-char)
+      (should-not (funcall show-paren-data-function)))))
+
+(ert-deftest toml-ts-mode-indents-incomplete-containers ()
+  (should (equal (toml-ts-mode-test--indent "a=[\n1\n" 2)
+                 "a=[\n  1\n"))
+  (should (equal (toml-ts-mode-test--indent "a={\nb=\n" 2)
+                 "a={\n  b=\n")))
+
 (ert-deftest toml-ts-mode-fontifies-every-content-and-digit-leaf ()
   (with-temp-buffer
     (insert "a = 1_000\nb = 1.2_3\nc = 0o77\nd = 0b10\n'key' = 'hello'\n"
@@ -550,9 +602,39 @@
 
 ;;;; Updates
 
+(ert-deftest toml-ts-mode-refreshes-string-syntax-after-issue-repair ()
+  (pcase-dolist (`(,delimiter ,invalid ,valid)
+                 '(("\"" "\\q" "\\n")
+                   ("'" "\0" "x")
+                   ("\"\"\"" "\n\\q" "\n\\n")
+                   ("'''" "\n\0" "\nx")))
+    (ert-info ((format "%S / %S" delimiter invalid))
+      (with-temp-buffer
+        (insert "key = " delimiter "text" invalid delimiter "\n")
+        (let ((treesit-font-lock-level 4)) (toml-ts-mode))
+        (pcase-dolist (`(,old ,new ,syntax)
+                       (list (list invalid invalid 1)
+                             (list invalid valid 15)
+                             (list valid invalid 1)))
+          (toml-ts-mode-test--buffer-state)
+          (goto-char (toml-ts-mode-test--position old))
+          (delete-char (length old))
+          (insert new)
+          (syntax-propertize (point-max))
+          (should (= (syntax-class (syntax-after 7)) syntax))
+          (should (= (syntax-class (syntax-after (- (point-max) 2))) syntax))
+          (toml-ts-mode-test--should-match-fresh-buffer 4))))))
+
 (ert-deftest toml-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
                  '(("a = [1, 2] # text\n" "[1, 2]" "\"[1, 2]\"" "1" font-lock-string-face)
+                   ("a=[1]\n" "[1]" "[01" "0" font-lock-number-face)
+                   ("a=07" "07" "07:32" "07" font-lock-constant-face)
+                   ("a=07:32" "07:32" "07" "07" font-lock-number-face)
+                   ("a=2026-12-01\n" "12-01" "13-" "13" font-lock-constant-face)
+                   ("a=\"x\\qy\"\n" "\\q" "\\u12" "\\u12" nil)
+                   ("# normal\n" "normal" "x\0y" "y" font-lock-comment-face)
+                   ("[[items]]\n" "]]" "]" "items" font-lock-property-name-face)
                    ("[[items]]\n" "[[items]]" "[items]" "[" font-lock-bracket-face)
                    ("a = \"unfinished\n" "unfinished" "finished\"" "finished" font-lock-string-face)
                    ("a = \"x\"\n" "\"x\"" "\"\"\"x\n# text\n\"\"\"" "text" font-lock-string-face)

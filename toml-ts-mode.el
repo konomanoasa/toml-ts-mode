@@ -47,7 +47,7 @@
 
 (defconst toml-ts-mode--grammar-sources
   '((toml "https://github.com/konomanoasa/tree-sitter-toml"
-          :revision "v0.5.0"))
+          :revision "v0.6.0"))
   "Tree-sitter grammar sources for TOML 1.1.0.")
 
 (defun toml-ts-mode--ensure-grammar (language)
@@ -123,6 +123,7 @@
                (let ((opening (treesit-node-child node 0))
                      (closing (treesit-node-child node -1)))
                  (when (and (not (treesit-node-check node 'has-error))
+                            (not (treesit-search-subtree node "^syntax_issue$"))
                             (member (treesit-node-type opening)
                                     '("\"" "'" "\"\"\"" "'''"))
                             (equal (treesit-node-type opening)
@@ -263,7 +264,8 @@ Pass ARG to `uncomment-region-default'."
    :default-language 'toml
 
    :feature 'comment
-   '((comment) @font-lock-comment-face)
+   '((comment !issue) @font-lock-comment-face
+     (comment_text) @font-lock-comment-face)
 
    :feature 'key
    '((unquoted_key) @font-lock-property-name-face
@@ -287,6 +289,8 @@ Pass ARG to `uncomment-region-default'."
 
    :feature 'number
    '((unsigned_dec_int [(digit) (digit1_9) "_"] @font-lock-number-face)
+     (invalid_number (digit) @font-lock-number-face)
+     (invalid_value (digit) @font-lock-number-face)
      (zero_prefixable_int [(digit) "_"] @font-lock-number-face)
      (dec_int ["+" "-"] @font-lock-number-face)
      (float_exp_part ["+" "-"] @font-lock-number-face)
@@ -302,6 +306,7 @@ Pass ARG to `uncomment-region-default'."
 
    :feature 'date-time
    '((date_fullyear (digit) @font-lock-constant-face)
+     (invalid_date_time (digit) @font-lock-constant-face)
      (date_month (digit) @font-lock-constant-face)
      (date_mday (digit) @font-lock-constant-face)
      (time_hour (digit) @font-lock-constant-face)
