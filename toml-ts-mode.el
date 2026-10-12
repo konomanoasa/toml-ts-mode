@@ -47,7 +47,7 @@
 
 (defconst toml-ts-mode--grammar-sources
   '((toml "https://github.com/konomanoasa/tree-sitter-toml"
-          :revision "v0.6.0"))
+          :revision "v0.7.0"))
   "Tree-sitter grammar sources for TOML 1.1.0.")
 
 (defun toml-ts-mode--ensure-grammar (language)
@@ -59,6 +59,108 @@
                  treesit-language-source-alist))))
     (or (treesit-ensure-installed language)
         (user-error "Tree-sitter grammar `%s' is unavailable" language))))
+
+;;;; Incremental Updates
+
+(defconst toml-ts-mode-update--containers
+  nil
+  "Container nodes traversed to find an edited source unit.")
+
+(defvar-local toml-ts-mode-update--state nil
+  "Bounds and recovery state captured before a buffer edit.")
+
+(defvar-local toml-ts-mode-update--pending-range nil
+  "Edited owner range awaiting syntax propertization.")
+
+(defun toml-ts-mode-update--bounds (beg end)
+  "Return enclosing source-unit bounds around BEG and END."
+  (let ((start beg)
+        (finish end)
+        (root (treesit-parser-root-node treesit-primary-parser)))
+    (dolist (position (list (max (point-min) (1- beg))
+                            (min (point-max) end)))
+      (let ((node (treesit-node-at position treesit-primary-parser))
+            owner)
+        (while (and node (not (treesit-node-eq node root)))
+          (unless (member (treesit-node-type node)
+                          toml-ts-mode-update--containers)
+            (setq owner node))
+          (setq node (treesit-node-parent node)))
+        (when owner
+          (setq start (min start (treesit-node-start owner))
+                finish (max finish (treesit-node-end owner))))))
+    (cons start finish)))
+
+(defun toml-ts-mode-update--before-change (beg end)
+  "Save owner bounds and old-tree recovery state before changing BEG to END."
+  (when treesit-primary-parser
+    (save-restriction
+      (widen)
+      (setq toml-ts-mode-update--state
+            (cons (toml-ts-mode-update--bounds beg end)
+                  (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser)
+                   'has-error))))))
+
+(defun toml-ts-mode-update--reset-parser ()
+  "Replace the primary parser without reusing its old tree."
+  (let* ((parser treesit-primary-parser)
+         (language (treesit-parser-language parser))
+         (tag (treesit-parser-tag parser))
+         (ranges (treesit-parser-included-ranges parser))
+         (notifiers (treesit-parser-notifiers parser))
+         (level (treesit-parser-embed-level parser)))
+    (treesit-parser-delete parser)
+    (setq treesit-primary-parser (treesit-parser-create language nil nil tag))
+    (treesit-parser-set-included-ranges treesit-primary-parser ranges)
+    (treesit-parser-set-embed-level treesit-primary-parser level)
+    (dolist (notifier notifiers)
+      (treesit-parser-add-notifier treesit-primary-parser notifier))))
+
+(defun toml-ts-mode-update--after-change (beg end old-length)
+  "Refresh edited owners and avoid stale trees after BEG, END and OLD-LENGTH."
+  (when treesit-primary-parser
+    (let ((narrowed (buffer-narrowed-p)))
+      (save-restriction
+        (widen)
+        (let* ((state toml-ts-mode-update--state)
+               (reset (or (cdr state)
+                          (and (= beg 1) (> old-length 0)
+                               (eq (char-after 1) #xfeff)))))
+          (setq toml-ts-mode-update--state nil)
+          (when reset (toml-ts-mode-update--reset-parser))
+          (let* ((bounds (if reset (cons (point-min) (point-max))
+                           (toml-ts-mode-update--bounds beg end)))
+                 (start (min (car bounds) (or (caar state) beg)))
+                 (finish (min (point-max)
+                              (max (cdr bounds)
+                                   (+ (or (cdar state) (+ beg old-length))
+                                      (- end beg old-length)))))
+                 (pending toml-ts-mode-update--pending-range)
+                 (pending-end (cdr pending)))
+            (when (and pending-end (>= pending-end beg))
+              (setq pending-end (max end (+ pending-end (- end beg old-length)))))
+            (setq toml-ts-mode-update--pending-range
+                  (cons (min start (or (car pending) start))
+                        (min (point-max) (max finish (or pending-end finish)))))
+            (syntax-ppss-flush-cache start)
+            (font-lock-flush start finish)
+            (when narrowed (syntax-propertize finish))))))))
+
+(defun toml-ts-mode-update--extend-region (start end)
+  "Include edited owners when propertizing START to END."
+  (when toml-ts-mode-update--pending-range
+    (let ((bounds toml-ts-mode-update--pending-range))
+      (setq toml-ts-mode-update--pending-range nil)
+      (cons (max (point-min) (min start (car bounds)))
+            (min (point-max) (max end (cdr bounds)))))))
+
+(defun toml-ts-mode-update--setup ()
+  "Configure incremental updates for the current buffer."
+  (add-hook 'before-change-functions #'toml-ts-mode-update--before-change nil t)
+  (add-hook 'after-change-functions #'toml-ts-mode-update--after-change nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'toml-ts-mode-update--extend-region nil t))
 
 ;;;; Syntax
 
@@ -143,11 +245,7 @@
                                (if (equal (treesit-node-type node) "}")
                                    "){" ")["))))
                  (put-text-property begin finish 'syntax-table
-                                    (string-to-syntax syntax))
-                 (when (> (- finish begin) 1)
-                   (put-text-property begin (1- finish) 'syntax-table
-                                      (string-to-syntax
-                                       (concat syntax "p")))))))))))))
+                                    (string-to-syntax syntax)))))))))))
 
 ;;;;; Matching Delimiters
 
@@ -166,19 +264,21 @@
                (opening (treesit-node-child owner 0))
                (closing (treesit-node-child owner -1)))
           (when (and (or (and (eq name 'open)
-                              (= position (treesit-node-start node)))
+                              (<= (treesit-node-start node) position)
+                              (< position (treesit-node-end node)))
                          (and (eq name 'close)
-                              (= position (treesit-node-end node))))
+                              (< (treesit-node-start node) position)
+                              (<= position (treesit-node-end node))))
                      (not (treesit-node-check opening 'missing))
                      (not (treesit-node-check closing 'missing))
                      (member (list (treesit-node-type opening)
                                    (treesit-node-type closing))
                              '(("[" "]") ("[[" "]]") ("{" "}"))))
-            (let ((other (if (eq name 'open) closing opening)))
-              (throw 'match (list (treesit-node-start node)
-                                  (treesit-node-end node)
-                                  (treesit-node-start other)
-                                  (treesit-node-end other))))))))))
+            (let* ((other (if (eq name 'open) closing opening))
+                   (start (if (eq name 'open) position (1- position)))
+                   (match (- (treesit-node-end other) 1
+                             (- start (treesit-node-start node)))))
+              (throw 'match (list start (1+ start) match (1+ match))))))))))
 
 ;;;;; Setup
 
@@ -441,7 +541,8 @@ Pass ARG to `uncomment-region-default'."
   (toml-ts-mode-navigation--setup)
   (toml-ts-mode-imenu--setup)
   (toml-ts-mode-indent--setup)
-  (treesit-major-mode-setup))
+  (treesit-major-mode-setup)
+  (toml-ts-mode-update--setup))
 
 ;;;###autoload
 (define-derived-mode toml-ts-mode prog-mode "TOML-TS"

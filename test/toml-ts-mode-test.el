@@ -35,6 +35,22 @@
 
 ;;;; Helpers
 
+(defmacro toml-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "toml-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (toml-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defun toml-ts-mode-test--position (fragment &optional line)
   "Return FRAGMENT's start in LINE, or anywhere when LINE is nil."
   (save-excursion
@@ -80,16 +96,22 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun toml-ts-mode-test--should-match-fresh-buffer (level)
-  "Check the current buffer against fresh fontification at LEVEL."
+(defun toml-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (toml-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (toml-ts-mode))
-      (should (equal state (toml-ts-mode-test--buffer-state))))))
+      (should (equal state (toml-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -167,19 +189,22 @@
     (insert "[[items]]\nx = [1, {a = 2}]\ns = \"[()] # text\"\n")
     (toml-ts-mode)
     (syntax-propertize (point-max))
-    (should (= 1 (car (syntax-ppss 3))))
+    (should (= 2 (car (syntax-ppss 3))))
     (should (= 0 (car (syntax-ppss 10))))
     (should (= 10 (scan-sexps 1 1)))
-    (goto-char (scan-sexps 10 -1))
-    (backward-prefix-chars)
-    (should (= 1 (point)))
+    (should (= 1 (scan-sexps 10 -1)))
+    (should (= 9 (scan-sexps 2 1)))
+    (should (= 2 (scan-sexps 9 -1)))
     (should (equal (mapcar (lambda (pos) (syntax-class (syntax-after pos)))
                            '(1 2 8 9))
                    '(4 4 5 5)))
-    (goto-char 1)
-    (should (equal (funcall show-paren-data-function) '(1 3 8 10)))
-    (goto-char 10)
-    (should (equal (funcall show-paren-data-function) '(8 10 1 3)))
+    (pcase-dolist (`(,position ,expected)
+                   '((1 (1 2 9 10))
+                     (2 (2 3 8 9))
+                     (9 (8 9 2 3))
+                     (10 (9 10 1 2))))
+      (goto-char position)
+      (should (equal (funcall show-paren-data-function) expected)))
     (goto-char (point-min))
     (search-forward "text")
     (should (nth 3 (syntax-ppss (point))))
@@ -198,6 +223,17 @@
                      (list start (1+ start) (+ start 2) (+ start 3)))))
     (goto-char (toml-ts-mode-test--position "[\\"))
     (should-not (funcall show-paren-data-function))))
+
+(ert-deftest toml-ts-mode-missing-closings-do-not-create-matching-delimiters ()
+  (dolist (source '("a=[1" "a={b=1" "[[a]"))
+    (with-temp-buffer
+      (insert source)
+      (toml-ts-mode)
+      (syntax-propertize (point-max))
+      (goto-char (point-min))
+      (search-forward (if (equal source "a={b=1") "{" "["))
+      (backward-char)
+      (should-not (funcall show-paren-data-function)))))
 
 ;;;; Comment Commands
 
@@ -405,11 +441,13 @@
 (ert-deftest toml-ts-mode-fontifies-normal-leaves-around-issues ()
   (with-temp-buffer
     (insert "[a b]\nx = [01, 2026-13-01, +in]\ns = \"x\\qy\"\n"
-            "# x\0y\nu = \"open")
+            "a=1x?e=2\na=1[items]\n# x\0y\nu = \"open")
     (let ((treesit-font-lock-level 4)) (toml-ts-mode))
     (font-lock-ensure)
     (pcase-dolist (`(,fragment ,offset ,face)
-                   '(("[a b]" 0 font-lock-bracket-face)
+                   '(("e=2" 0 font-lock-property-name-face)
+                     ("items" 0 font-lock-property-name-face)
+                     ("[a b]" 0 font-lock-bracket-face)
                      ("[a b]" 3 font-lock-property-name-face)
                      ("01," 0 font-lock-number-face)
                      ("01," 1 font-lock-number-face)
@@ -430,24 +468,7 @@
     (should (nth 4 (syntax-ppss (+ 4 (toml-ts-mode-test--position "# x\0y")))))
     (should-not (nth 3 (syntax-ppss (point-max))))
     (should (equal (mapcar #'car (cdar (funcall imenu-create-index-function)))
-                   '("[a b]")))))
-
-(ert-deftest toml-ts-mode-missing-closings-do-not-create-matching-delimiters ()
-  (dolist (source '("a=[1" "a={b=1" "[[a]"))
-    (with-temp-buffer
-      (insert source)
-      (toml-ts-mode)
-      (syntax-propertize (point-max))
-      (goto-char (point-min))
-      (search-forward (if (equal source "a={b=1") "{" "["))
-      (backward-char)
-      (should-not (funcall show-paren-data-function)))))
-
-(ert-deftest toml-ts-mode-indents-incomplete-containers ()
-  (should (equal (toml-ts-mode-test--indent "a=[\n1\n" 2)
-                 "a=[\n  1\n"))
-  (should (equal (toml-ts-mode-test--indent "a={\nb=\n" 2)
-                 "a={\n  b=\n")))
+                   '("[a b]" "[items]")))))
 
 (ert-deftest toml-ts-mode-fontifies-every-content-and-digit-leaf ()
   (with-temp-buffer
@@ -600,7 +621,59 @@
       (indent-according-to-mode)
       (should (= (current-column) 3)))))
 
+(ert-deftest toml-ts-mode-indents-incomplete-containers ()
+  (should (equal (toml-ts-mode-test--indent "a=[\n1\n" 2)
+                 "a=[\n  1\n"))
+  (should (equal (toml-ts-mode-test--indent "a={\nb=\n" 2)
+                 "a={\n  b=\n")))
+
 ;;;; Updates
+
+(ert-deftest toml-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((toml "test.toml" "" "key = \"value\"\n" "value" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (toml-ts-mode-test--with-file file properties source
+                                        (rename-buffer "toml-ts-mode-test" t)
+                                        (let ((noninteractive nil)) (font-lock-mode 1))
+                                        (toml-ts-mode-test--buffer-state)
+                                        (should (get-text-property owner-start 'fontified))
+                                        (let ((parser treesit-primary-parser))
+                                          (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                          (dolist (notifier (treesit-parser-notifiers parser))
+                                            (treesit-parser-remove-notifier parser notifier))
+                                          (goto-char (toml-ts-mode-test--position fragment))
+                                          (when narrow
+                                            (narrow-to-region (line-beginning-position) (line-end-position)))
+                                          (insert "x")
+                                          (widen)
+                                          (should (eq parser treesit-primary-parser))
+                                          (should-not (get-text-property owner-start 'fontified))
+                                          (toml-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
+(ert-deftest toml-ts-mode-reparses-a-bom-moved-to-buffer-start ()
+  (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
+                 '((toml "test.toml" "" "key = 1\n" "# note\n" "note" font-lock-comment-face)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (toml-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                        (toml-ts-mode-test--buffer-state)
+                                        (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                        (delete-region 1 (1+ (length prefix)))
+                                        (widen)
+                                        (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                        (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                       (concat "\ufeff" body)))
+                                        (toml-ts-mode-test--buffer-state)
+                                        (should-not (get-text-property 1 'face))
+                                        (goto-char (point-min))
+                                        (search-forward fragment)
+                                        (should (eq (get-text-property (1- (point)) 'face) face))
+                                        (toml-ts-mode-test--should-match-fresh-buffer 4 t)))))))
 
 (ert-deftest toml-ts-mode-refreshes-string-syntax-after-issue-repair ()
   (pcase-dolist (`(,delimiter ,invalid ,valid)
@@ -627,7 +700,8 @@
 
 (ert-deftest toml-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
-                 '(("a = [1, 2] # text\n" "[1, 2]" "\"[1, 2]\"" "1" font-lock-string-face)
+                 '(("a=1[items]\n" "items" "next" "next" font-lock-property-name-face)
+                   ("a = [1, 2] # text\n" "[1, 2]" "\"[1, 2]\"" "1" font-lock-string-face)
                    ("a=[1]\n" "[1]" "[01" "0" font-lock-number-face)
                    ("a=07" "07" "07:32" "07" font-lock-constant-face)
                    ("a=07:32" "07:32" "07" "07" font-lock-number-face)
