@@ -47,7 +47,7 @@
 
 (defconst toml-ts-mode--grammar-sources
   '((toml "https://github.com/konomanoasa/tree-sitter-toml"
-          :revision "v0.7.0"))
+          :revision "v0.7.1"))
   "Tree-sitter grammar sources for TOML 1.1.0.")
 
 (defun toml-ts-mode--ensure-grammar (language)
